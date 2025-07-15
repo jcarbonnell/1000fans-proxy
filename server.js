@@ -1,15 +1,16 @@
+// a proxy server for unauthenticated users to interact with the 1000fans app
 require('dotenv').config();
 
-// Configure logging
+//configure detailed logging
 const winston = require('winston');
 const logger = winston.createLogger({
   level: 'info',
   format: winston.format.combine(
-    winston.format.timestamp(),
+    winston.format.timestamp(), 
     winston.format.json()
   ),
   transports: [
-    new winston.transports.File({ filename: '/var/www/1000fans-proxy/server.log' }),
+    new winston.transports.File({ filename: process.env.LOG_FILE_PATH || '/var/www/1000fans-proxy/server.log' }),
     new winston.transports.Console()
   ],
 });
@@ -18,11 +19,11 @@ const express = require('express');
 const session = require('express-session');
 const MemoryStore = require('memorystore')(session);
 const fetch = require('node-fetch');
-let nearAPI, encoding;
+const { TextEncoder } = require('util');
+let nearAPI;
 try {
   nearAPI = require('near-api-js');
-  encoding = require('encoding');
-  logger.info('Dependencies loaded successfully', { nearAPI: '4.0.3', encoding: '0.1.13' });
+  logger.info('Dependencies loaded successfully', { nearAPI: '4.0.3' });
 } catch (error) {
   logger.error('Failed to load dependencies', { error: error.message });
   process.exit(1);
@@ -30,7 +31,6 @@ try {
 
 const { InMemoryKeyStore } = nearAPI.keyStores;
 const { KeyPair } = nearAPI.utils;
-const { TextEncoder } = encoding;
 const crypto = require('crypto');
 const base64url = require('base64url');
 
@@ -67,8 +67,14 @@ app.use(session({
   resave: false,
   saveUninitialized: true,
   store: new MemoryStore({ checkPeriod: 86400000 }),
-  cookie: { secure: true, httpOnly: true, maxAge: 24 * 60 * 60 * 1000 },
+  cookie: { secure: true, httpOnly: true, maxAge: 5 * 60 * 1000 }, // 5-minute sessions
 }));
+
+// Allowed commands for unauthenticated users
+const ALLOWED_UNAUTH_COMMANDS = [
+  'hi', 'hello', 'hey', 'hola', 'how are you',
+  'commands', 'spotify', 'youtube', 'contact', 'login'
+];
 
 // Check account status
 async function checkAccountStatus() {
@@ -91,8 +97,8 @@ async function checkAccountStatus() {
     });
     return {
       status: 'OK',
-      balance: Number(state.amount) / 1e24,
-      accessKeys
+      balance: (Number(state.amount) / 1e24).toString(),
+      accessKeys: accessKeys.map(k => k.public_key),
     };
   } catch (error) {
     logger.error('Error checking account status', { error: error.message });
@@ -106,17 +112,18 @@ async function generateAuthToken(useBase64url = false) {
     const keyStore = new InMemoryKeyStore();
     const keyPair = KeyPair.fromString(ANONYMOUS_PRIVATE_KEY);
     await keyStore.setKey('mainnet', ANONYMOUS_ACCOUNT_ID, keyPair);
-
+    
     const nonce = String(Date.now()).padStart(32, '0');
-    const recipient = 'near.ai';
+    const recipient = 'ai.near';
     const callbackUrl = 'https://theosis.1000fans.xyz/console';
     const message = 'Welcome to NEAR AI Hub!';
 
-    const nonceBuffer = Buffer.from(new TextEncoder().encode(nonce));
+    const textEncoder = new TextEncoder();
+    const nonceBuffer = textEncoder.encode(nonce);
     const messageBuffer = Buffer.concat([
-      Buffer.from(new TextEncoder().encode(message)),
+      textEncoder.encode(message),
       nonceBuffer,
-      Buffer.from(new TextEncoder().encode(recipient)),
+      textEncoder.encode(recipient),
     ]);
 
     const { signature } = keyPair.sign(messageBuffer);
@@ -162,18 +169,21 @@ async function fetchWithRetry(url, options, retries = 3, delay = 2000) {
           ...options.headers,
           'Accept': 'application/json',
           'Content-Type': options.body ? 'application/json' : undefined,
-          'User-Agent': 'Mozilla/5.0 (compatible; 1000fans-proxy/1.0)',
+          'User-Agent': '1000fans-proxy/1.0',
         },
       });
       const responseText = await response.text();
       const endTime = performance.now();
       logger.info('NEAR AI Hub response', {
         url,
+        method: options.method || 'GET',
+        requestHeaders: options.headers,
+        requestBody: options.body,
         duration: `${(endTime - startTime).toFixed(2)}ms`,
         status: response.status,
         statusText: response.statusText,
-        headers: Object.fromEntries(response.headers.entries()),
-        body: responseText,
+        responseHeaders: Object.fromEntries(response.headers.entries()),
+        responseBody: responseText,
         attempt: i + 1,
       });
       if (!response.ok) {
@@ -209,16 +219,21 @@ async function getOrCreateThread(req) {
   };
 
   logger.info('Creating thread', {
-    url: `${NEAR_AI_BASE_URL}/threads`,
+    url: `${NEAR_AI_BASE_URL}/assistants/threads`,
     headers: requestOptions.headers,
     body: requestOptions.body,
   });
 
-  const { data } = await fetchWithRetry(`${NEAR_AI_BASE_URL}/threads`, requestOptions);
-  session.threadId = data.id;
-  session.save();
-  logger.info('Thread created', { threadId: data.id });
-  return data.id;
+  try {
+    const { data } = await fetchWithRetry(`${NEAR_AI_BASE_URL}/assistants/threads`, requestOptions);
+    session.threadId = data.id;
+    session.save();
+    logger.info('Thread created', { threadId: data.id });
+    return data.id;
+  } catch (error) {
+    logger.error('Failed to create thread', { error: error.message });
+    throw new Error(`Failed to create thread: ${error.message}`);
+  }
 }
 
 // Proxy routes
@@ -252,11 +267,34 @@ app.get('/threads/:id/messages', async (req, res) => {
 
 app.post('/agent/runs', async (req, res) => {
   try {
-    const { thread_id, new_message, agent_id } = req.body;
+    const { thread_id, new_message, agent_id, user_id } = req.body;
     const sessionThreadId = req.session.threadId || await getOrCreateThread(req);
     if (thread_id && thread_id !== sessionThreadId) {
       return res.status(403).json({ error: 'Access denied to this thread' });
     }
+    
+    // Use anonymous account for unauthenticated users
+    const effectiveUserId = user_id || ANONYMOUS_ACCOUNT_ID;
+    const isAnonymous = effectiveUserId === ANONYMOUS_ACCOUNT_ID;
+
+    // Check for restricted commands
+    const messageLower = new_message.toLowerCase().trim();
+    if (isAnonymous && !ALLOWED_UNAUTH_COMMANDS.some(cmd => messageLower.includes(cmd))) {
+      logger.info('Restricted command attempted by anonymous user', { message: new_message });
+      return res.status(403).json({
+        error: 'Please login with an email or NEAR Wallet to perform this action.',
+        loginUrl: LOGIN_URL
+      });
+    }
+
+    // Handle explicit login command
+    if (messageLower === 'login') {
+      return res.json({
+        message: 'Please login with an email or NEAR Wallet.',
+        loginUrl: LOGIN_URL
+      });
+    }
+
     const authToken = await generateAuthToken();
     const requestBody = {
       agent_id: agent_id || 'devbot.near/manager-agent/latest',
@@ -265,14 +303,19 @@ app.post('/agent/runs', async (req, res) => {
       max_iterations: 1,
       record_run: true,
       tool_resources: {},
-      user_env_vars: {},
+      user_env_vars: { ANONYMOUS_ACCOUNT_ID: effectiveUserId },
     };
     const requestOptions = {
       method: 'POST',
       headers: { 'Authorization': `Bearer ${authToken}` },
       body: JSON.stringify(requestBody),
     };
-    logger.info('Running agent', requestOptions);
+    logger.info('Running agent', {
+      agent_id: requestBody.agent_id,
+      thread_id: requestBody.thread_id,
+      new_message,
+      user_id: effectiveUserId
+    });
     const { data } = await fetchWithRetry(`${NEAR_AI_BASE_URL}/agent/runs`, requestOptions);
     res.json(data);
   } catch (error) {
@@ -292,7 +335,7 @@ app.get('/health', async (req, res) => {
   }
 });
 
-// Test thread creation
+// Test routes
 app.post('/test-thread', async (req, res) => {
   try {
     const authToken = await generateAuthToken();
@@ -312,7 +355,6 @@ app.post('/test-thread', async (req, res) => {
   }
 });
 
-// Test minimal thread creation
 app.post('/test-minimal-thread', async (req, res) => {
   try {
     const authToken = await generateAuthToken();
@@ -330,7 +372,6 @@ app.post('/test-minimal-thread', async (req, res) => {
   }
 });
 
-// Test thread creation with minimal body
 app.post('/test-body-thread', async (req, res) => {
   try {
     const authToken = await generateAuthToken();
@@ -350,7 +391,6 @@ app.post('/test-body-thread', async (req, res) => {
   }
 });
 
-// Test thread creation without User-Agent
 app.post('/test-no-user-agent-thread', async (req, res) => {
   try {
     const authToken = await generateAuthToken();
@@ -377,7 +417,6 @@ app.post('/test-no-user-agent-thread', async (req, res) => {
   }
 });
 
-// Test thread creation with base64url signature
 app.post('/test-base64url-thread', async (req, res) => {
   try {
     const authToken = await generateAuthToken(true);
@@ -400,7 +439,6 @@ app.post('/test-base64url-thread', async (req, res) => {
 // Startup health check
 app.listen(PORT, () => {
   logger.info(`Proxy server running on port ${PORT}`);
-  // Test connectivity to NEAR RPC
   checkAccountStatus().then(() => {
     logger.info('Initial account status check completed');
   }).catch(error => {
