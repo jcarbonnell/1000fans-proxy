@@ -59,6 +59,7 @@ const NEAR_AI_BASE_URL = 'https://api.near.ai/v1';
 const ANONYMOUS_ACCOUNT_ID = process.env.ANONYMOUS_ACCOUNT_ID;
 const ANONYMOUS_PRIVATE_KEY = process.env.ANONYMOUS_PRIVATE_KEY;
 const ANONYMOUS_PUBLIC_KEY = process.env.ANONYMOUS_PUBLIC_KEY;
+const LOGIN_URL = 'https://theosis.1000fans.xyz/console';
 
 // Middleware
 app.use(express.json());
@@ -101,35 +102,31 @@ async function checkAccountStatus() {
       accessKeys: accessKeys.map(k => k.public_key),
     };
   } catch (error) {
-    logger.error('Error checking account status', { error: error.message });
+    logger.error('Error checking account status', { error: error.message, stack: error.stack });
     return { status: 'ERROR', error: error.message };
   }
 }
 
 // Generate NEAR AI auth token
-async function generateAuthToken(useBase64url = false) {
+async function generateAuthToken() {
   try {
     const keyStore = new InMemoryKeyStore();
     const keyPair = KeyPair.fromString(ANONYMOUS_PRIVATE_KEY);
     await keyStore.setKey('mainnet', ANONYMOUS_ACCOUNT_ID, keyPair);
     
     const nonce = String(Date.now()).padStart(32, '0');
-    const recipient = 'ai.near';
+    const recipient = 'near.ai';
     const callbackUrl = 'https://theosis.1000fans.xyz/console';
     const message = 'Welcome to NEAR AI Hub!';
 
-    const textEncoder = new TextEncoder();
-    const nonceBuffer = textEncoder.encode(nonce);
     const messageBuffer = Buffer.concat([
-      textEncoder.encode(message),
-      nonceBuffer,
-      textEncoder.encode(recipient),
+      Buffer.from(new TextEncoder().encode(message)),
+      Buffer.from(new TextEncoder().encode(nonce)),
+      Buffer.from(new TextEncoder().encode(recipient)),
     ]);
 
     const { signature } = keyPair.sign(messageBuffer);
-    const signatureEncoded = useBase64url
-      ? base64url.encode(signature)
-      : Buffer.from(signature).toString('base64');
+    const signatureEncoded = base64url.encode(signature);
 
     const authObject = {
       message,
@@ -145,7 +142,8 @@ async function generateAuthToken(useBase64url = false) {
     logger.info('Generated auth token', {
       messageString: `${message}${nonce}${recipient}`,
       messageBuffer: messageBuffer.toString('hex'),
-      nonceBuffer: nonceBuffer.toString('hex'),
+      nonceBuffer: Buffer.from(nonce).toString('hex'),
+      recipientBuffer: Buffer.from(recipient).toString('hex'),
       signature: Buffer.from(signature).toString('hex'),
       signatureEncoded,
       authObject,
@@ -153,7 +151,7 @@ async function generateAuthToken(useBase64url = false) {
     });
     return authToken;
   } catch (error) {
-    logger.error('Error generating auth token', { error: error.message });
+    logger.error('Error generating auth token', { error: error.message, stack: error.stack });
     throw new Error(`Failed to generate auth token: ${error.message}`);
   }
 }
@@ -170,6 +168,7 @@ async function fetchWithRetry(url, options, retries = 3, delay = 2000) {
           'Accept': 'application/json',
           'Content-Type': options.body ? 'application/json' : undefined,
           'User-Agent': '1000fans-proxy/1.0',
+          'x-stainless-os': 'linux',
         },
       });
       const responseText = await response.text();
@@ -191,7 +190,7 @@ async function fetchWithRetry(url, options, retries = 3, delay = 2000) {
       }
       return { response, data: responseText ? JSON.parse(responseText) : null };
     } catch (error) {
-      logger.error(`Attempt ${i + 1} failed`, { error: error.message });
+      logger.error(`Attempt ${i + 1} failed`, { error: error.message, stack: error.stack });
       if (i < retries - 1) {
         await new Promise(resolve => setTimeout(resolve, delay));
       } else {
@@ -219,19 +218,19 @@ async function getOrCreateThread(req) {
   };
 
   logger.info('Creating thread', {
-    url: `${NEAR_AI_BASE_URL}/assistants/threads`,
+    url: `${NEAR_AI_BASE_URL}/threads`,
     headers: requestOptions.headers,
     body: requestOptions.body,
   });
 
   try {
-    const { data } = await fetchWithRetry(`${NEAR_AI_BASE_URL}/assistants/threads`, requestOptions);
+    const { data } = await fetchWithRetry(`${NEAR_AI_BASE_URL}/threads`, requestOptions);
     session.threadId = data.id;
     session.save();
     logger.info('Thread created', { threadId: data.id });
     return data.id;
   } catch (error) {
-    logger.error('Failed to create thread', { error: error.message });
+    logger.error('Failed to create thread', { error: error.message, stack: error.stack });
     throw new Error(`Failed to create thread: ${error.message}`);
   }
 }
@@ -242,7 +241,7 @@ app.post('/threads', async (req, res) => {
     const threadId = await getOrCreateThread(req);
     res.json({ id: threadId });
   } catch (error) {
-    logger.error('Error in POST /threads', { error: error.message });
+    logger.error('Error in POST /threads', { error: error.message, stack: error.stack });
     res.status(500).json({ error: error.message });
   }
 });
@@ -260,7 +259,7 @@ app.get('/threads/:id/messages', async (req, res) => {
     const { data } = await fetchWithRetry(`${NEAR_AI_BASE_URL}/threads/${threadId}/messages`, requestOptions);
     res.json(data);
   } catch (error) {
-    logger.error('Error in GET /threads/:id/messages', { error: error.message });
+    logger.error('Error in GET /threads/:id/messages', { error: error.message, stack: error.stack });
     res.status(500).json({ error: error.message });
   }
 });
@@ -282,8 +281,8 @@ app.post('/agent/runs', async (req, res) => {
     if (isAnonymous && !ALLOWED_UNAUTH_COMMANDS.some(cmd => messageLower.includes(cmd))) {
       logger.info('Restricted command attempted by anonymous user', { message: new_message });
       return res.status(403).json({
-        error: 'Please login with an email or NEAR Wallet to perform this action.',
-        loginUrl: LOGIN_URL
+        error: 'Please login with an email or NEAR Wallet.',
+        openLoginModal: true
       });
     }
 
@@ -291,7 +290,7 @@ app.post('/agent/runs', async (req, res) => {
     if (messageLower === 'login') {
       return res.json({
         message: 'Please login with an email or NEAR Wallet.',
-        loginUrl: LOGIN_URL
+        openLoginModal: true
       });
     }
 
@@ -316,10 +315,10 @@ app.post('/agent/runs', async (req, res) => {
       new_message,
       user_id: effectiveUserId
     });
-    const { data } = await fetchWithRetry(`${NEAR_AI_BASE_URL}/agent/runs`, requestOptions);
+    const { data } = await fetchWithRetry(`${NEAR_AI_BASE_URL}/threads/runs`, requestOptions);
     res.json(data);
   } catch (error) {
-    logger.error('Error in POST /agent/runs', { error: error.message });
+    logger.error('Error in POST /agent/runs', { error: error.message, stack: error.stack });
     res.status(500).json({ error: error.message });
   }
 });
@@ -330,7 +329,7 @@ app.get('/health', async (req, res) => {
     const accountStatus = await checkAccountStatus();
     res.json({ status: 'OK', timestamp: new Date().toISOString(), accountStatus });
   } catch (error) {
-    logger.error('Error in /health', { error: error.message });
+    logger.error('Error in /health', { error: error.message, stack: error.stack });
     res.status(500).json({ error: error.message });
   }
 });
@@ -350,7 +349,7 @@ app.post('/test-thread', async (req, res) => {
     const { data } = await fetchWithRetry(`${NEAR_AI_BASE_URL}/threads`, requestOptions);
     res.json({ threadId: data.id });
   } catch (error) {
-    logger.error('Error in POST /test-thread', { error: error.message });
+    logger.error('Error in POST /test-thread', { error: error.message, stack: error.stack });
     res.status(500).json({ error: error.message });
   }
 });
@@ -367,7 +366,7 @@ app.post('/test-minimal-thread', async (req, res) => {
     const { data } = await fetchWithRetry(`${NEAR_AI_BASE_URL}/threads`, requestOptions);
     res.json({ threadId: data.id });
   } catch (error) {
-    logger.error('Error in POST /test-minimal-thread', { error: error.message });
+    logger.error('Error in POST /test-minimal-thread', { error: error.message, stack: error.stack });
     res.status(500).json({ error: error.message });
   }
 });
@@ -386,7 +385,7 @@ app.post('/test-body-thread', async (req, res) => {
     const { data } = await fetchWithRetry(`${NEAR_AI_BASE_URL}/threads`, requestOptions);
     res.json({ threadId: data.id });
   } catch (error) {
-    logger.error('Error in POST /test-body-thread', { error: error.message });
+    logger.error('Error in POST /test-body-thread', { error: error.message, stack: error.stack });
     res.status(500).json({ error: error.message });
   }
 });
@@ -408,18 +407,19 @@ app.post('/test-no-user-agent-thread', async (req, res) => {
         'Authorization': requestOptions.headers.Authorization,
         'Accept': 'application/json',
         'Content-Type': 'application/json',
+        'x-stainless-os': 'linux',
       },
     });
     res.json({ threadId: data.id });
   } catch (error) {
-    logger.error('Error in POST /test-no-user-agent-thread', { error: error.message });
+    logger.error('Error in POST /test-no-user-agent-thread', { error: error.message, stack: error.stack });
     res.status(500).json({ error: error.message });
   }
 });
 
 app.post('/test-base64url-thread', async (req, res) => {
   try {
-    const authToken = await generateAuthToken(true);
+    const authToken = await generateAuthToken();
     const requestBody = {
       messages: [{ role: 'user', content: 'Test message', metadata: {} }],
     };
@@ -431,7 +431,7 @@ app.post('/test-base64url-thread', async (req, res) => {
     const { data } = await fetchWithRetry(`${NEAR_AI_BASE_URL}/threads`, requestOptions);
     res.json({ threadId: data.id });
   } catch (error) {
-    logger.error('Error in POST /test-base64url-thread', { error: error.message });
+    logger.error('Error in POST /test-base64url-thread', { error: error.message, stack: error.stack });
     res.status(500).json({ error: error.message });
   }
 });
@@ -442,6 +442,6 @@ app.listen(PORT, () => {
   checkAccountStatus().then(() => {
     logger.info('Initial account status check completed');
   }).catch(error => {
-    logger.error('Initial account status check failed', { error: error.message });
+    logger.error('Initial account status check failed', { error: error.message, stack: error.stack });
   });
 });
