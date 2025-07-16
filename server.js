@@ -59,7 +59,6 @@ const NEAR_AI_BASE_URL = 'https://api.near.ai/v1';
 const ANONYMOUS_ACCOUNT_ID = process.env.ANONYMOUS_ACCOUNT_ID;
 const ANONYMOUS_PRIVATE_KEY = process.env.ANONYMOUS_PRIVATE_KEY;
 const ANONYMOUS_PUBLIC_KEY = process.env.ANONYMOUS_PUBLIC_KEY;
-const LOGIN_URL = 'https://theosis.1000fans.xyz/console';
 
 // Middleware
 app.use(express.json());
@@ -190,7 +189,12 @@ async function fetchWithRetry(url, options, retries = 3, delay = 2000) {
       }
       return { response, data: responseText ? JSON.parse(responseText) : null };
     } catch (error) {
-      logger.error(`Attempt ${i + 1} failed`, { error: error.message, stack: error.stack });
+      logger.error(`Attempt ${i + 1} failed`, {
+        url,
+        error: error.message,
+        responseBody: error.message.includes('HTTP') ? error.message : undefined,
+        stack: error.stack,
+      });
       if (i < retries - 1) {
         await new Promise(resolve => setTimeout(resolve, delay));
       } else {
