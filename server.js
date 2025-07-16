@@ -172,6 +172,7 @@ async function fetchWithRetry(url, options, retries = 3, delay = 2000) {
       });
       const responseText = await response.text();
       const endTime = performance.now();
+      const responseHeaders = Object.fromEntries(response.headers.entries());
       logger.info('NEAR AI Hub response', {
         url,
         method: options.method || 'GET',
@@ -180,12 +181,12 @@ async function fetchWithRetry(url, options, retries = 3, delay = 2000) {
         duration: `${(endTime - startTime).toFixed(2)}ms`,
         status: response.status,
         statusText: response.statusText,
-        responseHeaders: Object.fromEntries(response.headers.entries()),
+        responseHeaders,
         responseBody: responseText,
         attempt: i + 1,
       });
       if (!response.ok) {
-        throw new Error(`HTTP ${response.status}: ${responseText}`);
+        throw new Error(`HTTP ${response.status}: ${responseText || response.statusText}`);
       }
       return { response, data: responseText ? JSON.parse(responseText) : null };
     } catch (error) {
@@ -361,11 +362,9 @@ app.post('/test-thread', async (req, res) => {
 app.post('/test-minimal-thread', async (req, res) => {
   try {
     const authToken = await generateAuthToken();
-    const requestBody = req.body || {};
     const requestOptions = {
       method: 'POST',
       headers: { 'Authorization': `Bearer ${authToken}` },
-      body: Object.keys(requestBody).length ? JSON.stringify(requestBody) : undefined,
     };
     const { data } = await fetchWithRetry(`${NEAR_AI_BASE_URL}/threads`, requestOptions);
     res.json({ threadId: data.id });
