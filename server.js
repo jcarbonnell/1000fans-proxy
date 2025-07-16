@@ -114,7 +114,7 @@ async function generateAuthToken() {
     await keyStore.setKey('mainnet', ANONYMOUS_ACCOUNT_ID, keyPair);
     
     const nonce = String(Date.now()).padStart(32, '0');
-    const recipient = 'near.ai';
+    const recipient = 'ai.near';
     const callbackUrl = 'https://theosis.1000fans.xyz/console';
     const message = 'Welcome to NEAR AI Hub!';
 
